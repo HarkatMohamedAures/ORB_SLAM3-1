@@ -16,13 +16,33 @@
 * If not, see <http://www.gnu.org/licenses/>.
 */
 
+/**
+* This file is part of ORB-SLAM3
+*
+* Copyright (C) 2017-2020 Carlos Campos, Richard Elvira, Juan J. Gómez Rodríguez, José M.M. Montiel and Juan D. Tardós, University of Zaragoza.
+* Copyright (C) 2014-2016 Raúl Mur-Artal, José M.M. Montiel and Juan D. Tardós, University of Zaragoza.
+*
+* ORB-SLAM3 is free software: you can redistribute it and/or modify it under the terms of the GNU General Public
+* License as published by the Free Software Foundation, either version 3 of the License, or
+* (at your option) any later version.
+*
+* ORB-SLAM3 is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even
+* the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+* GNU General Public License for more details.
+*
+* You should have received a copy of the GNU General Public License along with ORB-SLAM3.
+* If not, see <http://www.gnu.org/licenses/>.
+*/
+
 
 #include<iostream>
 #include<algorithm>
 #include<fstream>
 #include<chrono>
+#include "math.h"
 
 #include<ros/ros.h>
+#include <geometry_msgs/PoseStamped.h>
 #include <cv_bridge/cv_bridge.h>
 #include <message_filters/subscriber.h>
 #include <message_filters/time_synchronizer.h>
@@ -37,31 +57,45 @@ using namespace std;
 class ImageGrabber
 {
 public:
-    ImageGrabber(ORB_SLAM2::System* pSLAM):mpSLAM(pSLAM){}
+    ImageGrabber(ORB_SLAM3::System* pSLAM, ros::NodeHandle* ptn_nh):mpSLAM(pSLAM){
+	nh = *ptn_nh;
+	pose_pub = nh.advertise<geometry_msgs::PoseStamped>("orb_pose", 1000);
+	
+	}
 
     void GrabStereo(const sensor_msgs::ImageConstPtr& msgLeft,const sensor_msgs::ImageConstPtr& msgRight);
+	cv::Vec3f rotationMatrixToEulerAngles(cv::Mat &R);
 
-    ORB_SLAM2::System* mpSLAM;
+    ORB_SLAM3::System* mpSLAM;
     bool do_rectify;
-    cv::Mat M1l,M2l,M1r,M2r;
+	ros::NodeHandle nh;
+	ros::Publisher pose_pub;
+	
+    cv::Mat M1l,M2l,M1r,M2r, transform_mat, T, R, pose;
+	cv::Vec3f euler_angles;
+	geometry_msgs::PoseStamped ros_pose;
+	
+	
+	
 };
 
 int main(int argc, char **argv)
 {
     ros::init(argc, argv, "RGBD");
     ros::start();
+	ros::NodeHandle nh;
 
     if(argc != 4)
     {
-        cerr << endl << "Usage: rosrun ORB_SLAM2 Stereo path_to_vocabulary path_to_settings do_rectify" << endl;
+        cerr << endl << "Usage: rosrun ORB_SLAM3 Stereo path_to_vocabulary path_to_settings do_rectify" << endl;
         ros::shutdown();
         return 1;
     }    
 
     // Create SLAM system. It initializes all system threads and gets ready to process frames.
-    ORB_SLAM2::System SLAM(argv[1],argv[2],ORB_SLAM2::System::STEREO,true);
+    ORB_SLAM3::System SLAM(argv[1],argv[2],ORB_SLAM3::System::STEREO,true);
 
-    ImageGrabber igb(&SLAM);
+    ImageGrabber igb(&SLAM, &nh);
 
     stringstream ss(argv[3]);
 	ss >> boolalpha >> igb.do_rectify;
@@ -105,7 +139,7 @@ int main(int argc, char **argv)
         cv::initUndistortRectifyMap(K_r,D_r,R_r,P_r.rowRange(0,3).colRange(0,3),cv::Size(cols_r,rows_r),CV_32F,igb.M1r,igb.M2r);
     }
 
-    ros::NodeHandle nh;
+    
 
     message_filters::Subscriber<sensor_msgs::Image> left_sub(nh, "/camera/left/image_raw", 1);
     message_filters::Subscriber<sensor_msgs::Image> right_sub(nh, "camera/right/image_raw", 1);
@@ -158,13 +192,61 @@ void ImageGrabber::GrabStereo(const sensor_msgs::ImageConstPtr& msgLeft,const se
         cv::Mat imLeft, imRight;
         cv::remap(cv_ptrLeft->image,imLeft,M1l,M2l,cv::INTER_LINEAR);
         cv::remap(cv_ptrRight->image,imRight,M1r,M2r,cv::INTER_LINEAR);
-        mpSLAM->TrackStereo(imLeft,imRight,cv_ptrLeft->header.stamp.toSec());
+        transform_mat = mpSLAM->TrackStereo(imLeft,imRight,cv_ptrLeft->header.stamp.toSec());
     }
     else
     {
-        mpSLAM->TrackStereo(cv_ptrLeft->image,cv_ptrRight->image,cv_ptrLeft->header.stamp.toSec());
+        transform_mat = mpSLAM->TrackStereo(cv_ptrLeft->image,cv_ptrRight->image,cv_ptrLeft->header.stamp.toSec());
     }
+	
+	if(!transform_mat.empty())
+	{
+		R = transform_mat(cv::Rect(0,0, 3,3));
+		T = transform_mat(cv::Rect(3,0, 1,3));
+		pose = -R.t() * T;
+		euler_angles = rotationMatrixToEulerAngles(R);
+		ros_pose.pose.position.x = pose.at<float>(0,0);
+		ros_pose.pose.position.y = pose.at<float>(1,0);
+		ros_pose.pose.position.z = pose.at<float>(2,0);
+		
+		
+		ros_pose.pose.orientation.x = euler_angles[0];
+		ros_pose.pose.orientation.y = euler_angles[1];
+		ros_pose.pose.orientation.z = euler_angles[2];
+
+		ros_pose.header.stamp = ros::Time::now();
+		pose_pub.publish(ros_pose);
+
+				
+		
+	}
+	
+}
+
+cv::Vec3f ImageGrabber::rotationMatrixToEulerAngles(cv::Mat &R)
+{
+
+
+    float sy = sqrt(R.at<float>(0,0) * R.at<float>(0,0) +  R.at<float>(1,0) * R.at<float>(1,0) );
+
+    bool singular = sy < 1e-6; 
+
+    float x, y, z;
+    if (!singular)
+    {
+        x = atan2(R.at<float>(2,1) , R.at<float>(2,2));
+        y = atan2(-R.at<float>(2,0), sy);
+        z = atan2(R.at<float>(1,0), R.at<float>(0,0));
+    }
+    else
+    {
+        x = atan2(-R.at<float>(1,2), R.at<float>(1,1));
+        y = atan2(-R.at<float>(2,0), sy);
+        z = 0;
+    }
+    return cv::Vec3f(x, y, z);
 
 }
+
 
 
